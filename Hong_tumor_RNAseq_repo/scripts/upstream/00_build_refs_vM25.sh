@@ -7,7 +7,7 @@
 #SBATCH --partition=HTC
 #SBATCH --output=%x_%j.out
 #SBATCH --error=%x_%j.err
-#SBATCH --mail-user=ZIW183@pitt.edu
+#SBATCH --mail-user=your_email
 #SBATCH --mail-type=END,FAIL
 # Build ALL references from ONE annotation (GENCODE vM25, GRCm38/mm10):
 #   - Salmon decoy-aware index (vM25 transcripts + genome decoys, --gencode)
