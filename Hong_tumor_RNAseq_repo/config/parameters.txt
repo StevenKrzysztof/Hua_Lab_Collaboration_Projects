@@ -1,0 +1,33 @@
+Key parameters and thresholds
+=============================
+Library            : Novogene Eukaryotic mRNA-seq, paired-end 150 bp, UNSTRANDED (Salmon auto-detect: IU in all samples)
+
+Trimming (cutadapt): -a AGATCGGAAGAGC -A AGATCGGAAGAGC --nextseq-trim=20 -m 20:20 -j 8
+                     plain-text output, then every FASTQ validated (4-line records, seq/qual length) before alignment
+
+STAR (alignment)   : --outSAMtype BAM SortedByCoordinate --outSAMstrandField intronMotif
+                     --outFilterMultimapNmax 100 --winAnchorMultimapNmax 200 --quantMode GeneCounts
+                     (multimapping limits kept high so the same BAMs serve TE quantification)
+Salmon (quant)     : salmon quant -l A --gcBias --seqBias, decoy-aware vM25 index (selective alignment)
+
+tximport           : type = "salmon", tx2gene = vM25 (transcript_id -> gene_id), default countsFromAbundance = "no"
+                     DESeqDataSetFromTximport (gene-length offsets used by DESeq2)
+Gene filter        : keep genes with >= 10 counts in >= 2 of the 3 samples of at least one group
+DESeq2 design      : ~ group   (NT_PBS, NT_PD1, sg7_PBS, sg7_PD1), one model on all 12 tumors
+Contrasts          : NT_PD1 vs NT_PBS;  sg7_PD1 vs sg7_PBS;
+                     Interaction = (sg7_PD1 - sg7_PBS) - (NT_PD1 - NT_PBS)  (numeric contrast on ~group coefficients)
+DE threshold       : padj (BH) < 0.05 and |log2FC| > 1 (unshrunken MLE log2FC); results() alpha = 0.05
+VST                : vst(blind = FALSE) for heatmaps/PCA/scores; PCA on the 500 most variable genes
+
+ORA                : clusterProfiler enrichGO (BP, keyType ENSEMBL), enricher (Hallmark), enrichKEGG (mmu);
+                     up and down genes separately; universe = all genes passing the filter; BH; significant: p.adjust < 0.05
+                     gene sets: NT up/down, sg7 up/down, Shared, NT-only, sg7-only (up and down)
+GSEA               : clusterProfiler GSEA (Hallmark), gseGO (BP), gseKEGG; ranked by DESeq2 Wald stat;
+                     minGSSize 15, maxGSSize 500, eps 0, pvalueCutoff 1 (all terms reported), BH, seed = TRUE (set.seed(1))
+Custom signatures  : metadata/gene_sets.csv. Module score per sample = mean of per-gene z-scores of VST expression
+                     (z-scored across all 12 tumors) over the module genes present in the filtered matrix.
+NT-vs-sg7 categories: Shared (significant in both, same sign), NT only, sg7 only, Opposite.
+
+TE quantification  : TElocal (locus) and TEcount (subfamily), --stranded no, mode multi, gene GTF vM25;
+                     filter >= 5 reads in >= 2 of 3 samples of a group; only LINE, SINE, LTR, DNA, RC tested;
+                     size factors from genes + TEs; same design / contrasts / thresholds as above.

@@ -1,0 +1,42 @@
+Software versions
+=================
+Command-line tools (conda env nacevlab; TE tools from the TEtranscripts virtualenv)
+  cutadapt          5.2
+  STAR              2.7.11b
+  samtools          1.23.1
+  Salmon            2.0.1        (version recorded per sample in STAR_vM25/<sample>/<sample>_run_info.txt)
+  TElocal           1.1.3
+  TEcount           2.2.4        (TEtranscripts package)
+
+R (analysis run in RStudio on the cluster)
+  R                 4.6.0 (2026-04-24)
+  Bioconductor      3.23
+
+R / Bioconductor packages
+  tximport          1.40.0
+  DESeq2            1.52.0
+  clusterProfiler   4.20.0
+  enrichplot        1.32.0
+  fgsea             1.38.0       (GSEA engine used by clusterProfiler)
+  org.Mm.eg.db      3.23.0
+  AnnotationDbi     1.74.0
+  msigdbr           26.1.0       (MSigDB release 2026.1; Hallmark gene sets, Mus musculus)
+  rtracklayer       1.72.0
+  GenomicRanges     1.64.0
+  data.table        1.18.2.1
+  dplyr             1.2.1
+  tidyr             1.3.2
+  tibble            3.3.1
+  matrixStats       1.5.0
+  ggplot2           4.0.3
+  ggrepel           0.9.8
+  pheatmap          1.0.13
+  RColorBrewer      1.1.3
+  VennDiagram       1.8.2
+  scales            1.4.0
+  knitr             1.51
+  rmarkdown         2.31
+
+Annotation databases
+  GENCODE           vM25 (GRCm38)        — see config/reference_genome.txt
+  KEGG              queried online at run time via clusterProfiler (enrichKEGG / gseKEGG); date of analysis = KEGG release

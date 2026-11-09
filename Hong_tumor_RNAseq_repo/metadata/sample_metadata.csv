@@ -1,0 +1,13 @@
+sample,genotype,treatment,raw_fastq_folder,sequencing_batch,notes
+NB_2R,NT,PBS,/ix1/hzhang/HongCao/RNAseq_202604_org_tumor/tumor/01.RawData/NB_2R,Novogene tumor delivery,
+NB_5L,NT,PBS,/ix1/hzhang/HongCao/RNAseq_202604_org_tumor/tumor/01.RawData/NB_5L,Novogene tumor delivery,
+NB_6L,NT,PBS,/ix1/hzhang/HongCao/RNAseq_202604_org_tumor/tumor/01.RawData/NB_6L,Novogene tumor delivery,
+ND_9L,NT,PD1,/ix1/hzhang/HongCao/RNAseq_202604_org_tumor/tumor/01.RawData/ND_9L,Novogene tumor delivery,
+ND_10R_2,NT,PD1,/ix1/hzhang/HongCao/RNAseq_202604_org_tumor/org/01.RawData/ND_10R_2,Novogene org delivery,re-sequenced tumor delivered with the organoid batch; clusters apart in sample-distance heatmap
+ND_11L_2,NT,PD1,/ix1/hzhang/HongCao/RNAseq_202604_org_tumor/org/01.RawData/ND_11L_2,Novogene org delivery,re-sequenced tumor delivered with the organoid batch; clusters apart in sample-distance heatmap
+S7B_24R,sg7,PBS,/ix1/hzhang/HongCao/RNAseq_202604_org_tumor/tumor/01.RawData/S7B_24R,Novogene tumor delivery,
+S7B_25R,sg7,PBS,/ix1/hzhang/HongCao/RNAseq_202604_org_tumor/tumor/01.RawData/S7B_25R,Novogene tumor delivery,
+S7B_28L,sg7,PBS,/ix1/hzhang/HongCao/RNAseq_202604_org_tumor/tumor/01.RawData/S7B_28L,Novogene tumor delivery,
+S7D_30L,sg7,PD1,/ix1/hzhang/HongCao/RNAseq_202604_org_tumor/tumor/01.RawData/S7D_30L,Novogene tumor delivery,
+S7D_30R,sg7,PD1,/ix1/hzhang/HongCao/RNAseq_202604_org_tumor/tumor/01.RawData/S7D_30R,Novogene tumor delivery,
+S7D_34L,sg7,PD1,/ix1/hzhang/HongCao/RNAseq_202604_org_tumor/tumor/01.RawData/S7D_34L,Novogene tumor delivery,

@@ -1,0 +1,427 @@
+---
+title: "Hong tumor TE analysis — PD1 vs PBS within NT and within sg7 (TElocal + TEcount, vM25 BAMs)"
+author: "Steve Wang"
+date: "`r Sys.Date()`"
+output: html_notebook
+---
+
+Same design as the RNA-seq analysis: one DESeq2 model, `~ group` (NT_PBS, NT_PD1, sg7_PBS, sg7_PD1), n = 3.
+
+* Contrasts: PD1 vs PBS within NT, PD1 vs PBS within sg7, and the interaction.
+* Two count sets: **TElocal** (locus level) and **TEcount** (subfamily level), both `--stranded no` (library = IU).
+* Size factors from genes + TEs (TEtranscripts convention); only real TEs tested
+  (LINE, SINE, LTR, DNA, RC — Satellite / Other / RNA / Unknown / "?" dropped).
+* Per contrast: annotation tables, class bar / pie / proportion / count plots, top subfamilies, volcano
+  (same axes for NT and sg7), heatmaps ordered by group, PCA, p-value histogram, filter sensitivity.
+* Comparison: NT vs sg7 PD1 response (Venn, quadrant plot by TE class), TElocal (rolled up) vs TEcount.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, fig.width = 8, fig.height = 6)
+suppressPackageStartupMessages({
+  library(data.table); library(matrixStats); library(DESeq2)
+  library(dplyr); library(tidyr); library(tibble)
+  library(ggplot2); library(ggrepel); library(pheatmap); library(RColorBrewer)
+  library(VennDiagram); library(grid); library(scales)
+})
+futile.logger::flog.threshold(futile.logger::ERROR, name = "VennDiagramLogger")
+count <- dplyr::count; select <- dplyr::select; filter <- dplyr::filter
+first <- dplyr::first; last <- dplyr::last; between <- dplyr::between
+```
+
+# Configuration
+
+```{r config}
+BASE   <- "/ix1/hzhang/SteveWang/Hong_data/tumor_RNA_Seq"
+OUTDIR <- file.path(BASE, "TE_results_vM25_PD1_vs_PBS")
+dir.create(OUTDIR, recursive = TRUE, showWarnings = FALSE)
+DATASETS <- list(TElocal = file.path(BASE, "TE_res_vM25", "TElocal"),     # {sample}.cntTable
+                 TEcount = file.path(BASE, "TE_res_vM25", "TEcount"))
+TE_GTF   <- "/ix1/bnacev/ziw183/ref/mm10/mm10_rmsk_TE.gtf"               # locus coordinates for BED output
+
+samples <- data.frame(
+  sample    = c("NB_2R", "NB_5L", "NB_6L",   "ND_9L", "ND_10R_2", "ND_11L_2",
+                "S7B_24R", "S7B_25R", "S7B_28L", "S7D_30L", "S7D_30R", "S7D_34L"),
+  genotype  = rep(c("NT", "NT", "sg7", "sg7"), each = 3),
+  treatment = rep(c("PBS", "PD1", "PBS", "PD1"), each = 3), stringsAsFactors = FALSE)
+SAMPLES <- samples$sample
+coldata <- data.frame(row.names = SAMPLES,
+                      genotype  = factor(samples$genotype,  levels = c("NT", "sg7")),
+                      treatment = factor(samples$treatment, levels = c("PBS", "PD1")),
+                      group     = factor(paste(samples$genotype, samples$treatment, sep = "_"),
+                                         levels = c("NT_PBS", "NT_PD1", "sg7_PBS", "sg7_PD1")))
+MAIN <- c("NT_PD1_vs_PBS", "sg7_PD1_vs_PBS")
+KEEP_CLASSES    <- c("LINE", "SINE", "LTR", "DNA", "RC")
+MIN_COUNT       <- 5;  MIN_SAMPLES <- 2       # >= 5 reads in >= 2 of 3 samples of at least one group
+SENS_MIN_COUNTS <- c(1, 5, 10)
+PADJ_CUT <- 0.05; LFC_CUT <- 1
+
+grp_cols   <- c(NT_PBS = "#9ECAE1", NT_PD1 = "#2171B5", sg7_PBS = "#FDAE6B", sg7_PD1 = "#D94801")
+geno_cols  <- c(NT = "#2171B5", sg7 = "#D94801"); trt_cols <- c(PBS = "grey80", PD1 = "grey30")
+class_cols <- c(LINE = "#1F78B4", SINE = "#33A02C", LTR = "#E31A1C", DNA = "#FF7F00", RC = "#6A3D9A")
+hm_cols    <- colorRampPalette(rev(brewer.pal(11, "RdBu")))(255)
+ann_colors <- list(group = grp_cols, genotype = geno_cols, treatment = trt_cols, Class = class_cols)
+```
+
+# Helpers
+
+```{r helpers}
+load_cnt <- function(dir, files) {
+  vecs <- lapply(files, function(s) {
+    f <- file.path(dir, paste0(s, ".cntTable"))
+    if (!file.exists(f)) stop("Missing count table: ", f)
+    d <- fread(f, header = TRUE, sep = "\t", quote = "", data.table = FALSE)
+    setNames(as.numeric(d[[2]]), d[[1]])
+  })
+  ids <- Reduce(union, lapply(vecs, names))
+  m <- vapply(vecs, function(v) { x <- v[ids]; x[is.na(x)] <- 0; x }, numeric(length(ids)))
+  m <- round(m); storage.mode(m) <- "integer"; dimnames(m) <- list(ids, files); m
+}
+is_te    <- function(ids) grepl(":", ids, fixed = TRUE)
+te_class <- function(ids) sub(".*:", "", ids)
+te_level <- function(id) if (length(strsplit(id, ":", fixed = TRUE)[[1]]) >= 4) "locus" else "subfamily"
+sub_key  <- function(ids) sub("^[^:]+:", "", ids)
+annotate_te <- function(ids, level) {
+  if (!length(ids)) return(tibble(TE_ID = character(), Locus = character(), Subfamily = character(),
+                                  Family = character(), Class = character()))
+  p <- tstrsplit(ids, ":", fixed = TRUE)
+  if (level == "locus") tibble(TE_ID = ids, Locus = p[[1]], Subfamily = p[[2]], Family = p[[3]], Class = p[[4]])
+  else                  tibble(TE_ID = ids, Locus = NA_character_, Subfamily = p[[1]], Family = p[[2]], Class = p[[3]])
+}
+filter_by_group <- function(mat, groups, min_count, min_samples) {
+  keep <- rep(FALSE, nrow(mat))
+  for (g in unique(groups)) {
+    cols <- which(groups == g)
+    keep <- keep | (rowSums(mat[, cols, drop = FALSE] >= min_count) >= min(min_samples, length(cols)))
+  }
+  mat[keep, , drop = FALSE]
+}
+zrow      <- function(m) { z <- t(scale(t(m))); z[is.na(z)] <- 0; z }
+save_plot <- function(p, path, w = 8, h = 6) { ggsave(path, p, width = w, height = h); print(p) }
+safe_vst  <- function(dds, blind = TRUE) {
+  if (nrow(dds) < 5000) varianceStabilizingTransformation(dds, blind = blind) else vst(dds, blind = blind)
+}
+safe_venn <- function(a, b, labels, fill, path, main = NULL) {
+  if (length(a) + length(b) == 0) { message("Venn skipped (empty): ", basename(path)); return(invisible(NULL)) }
+  v <- draw.pairwise.venn(length(a), length(b), length(intersect(a, b)), category = labels,
+                          fill = fill, alpha = 0.5, cex = 1.6, cat.cex = 1.2, ind = FALSE)
+  draw <- function() { grid.newpage(); if (!is.null(main)) grid.text(main, y = 0.95, gp = gpar(fontsize = 13)); grid.draw(v) }
+  draw(); pdf(path, 7, 6); draw(); dev.off()
+}
+make_contrasts <- function(dds) {
+  rn <- resultsNames(dds)
+  need <- c("group_NT_PD1_vs_NT_PBS", "group_sg7_PBS_vs_NT_PBS", "group_sg7_PD1_vs_NT_PBS")
+  stopifnot(all(need %in% rn))
+  iv <- setNames(rep(0, length(rn)), rn)
+  iv["group_sg7_PD1_vs_NT_PBS"] <- 1; iv["group_sg7_PBS_vs_NT_PBS"] <- -1; iv["group_NT_PD1_vs_NT_PBS"] <- -1
+  list(NT_PD1_vs_PBS  = c("group", "NT_PD1", "NT_PBS"),
+       sg7_PD1_vs_PBS = c("group", "sg7_PD1", "sg7_PBS"),
+       Interaction    = unname(iv))
+}
+```
+
+```{r te_coords}
+gtf <- fread(TE_GTF, sep = "\t", header = FALSE, select = c(1, 4, 5, 7, 9), quote = "")
+gtf[, Locus := sub('.*transcript_id "([^"]+)".*', "\\1", V9)]
+te_coords <- as.data.frame(gtf[, .(chr = V1[1], start = min(V4) - 1L, end = max(V5), strand = V7[1]), by = Locus])
+rm(gtf); invisible(gc())
+```
+
+# Plot functions
+
+```{r plot_functions}
+plot_bar_class <- function(df, title, path) {
+  if (!nrow(df)) return(invisible(NULL))
+  cnt <- df %>% count(Class, dir, name = "Count") %>% mutate(dir = factor(dir, levels = c("Upregulated", "Downregulated")))
+  lv <- cnt %>% group_by(Class) %>% summarise(T = sum(Count), .groups = "drop") %>% arrange(desc(T)) %>% pull(Class)
+  cnt$Class <- factor(cnt$Class, levels = lv)
+  p <- ggplot(cnt, aes(Class, Count, fill = dir)) + geom_col(position = position_dodge(0.9)) +
+    geom_text(aes(label = Count), position = position_dodge(0.9), vjust = -0.25, size = 3) +
+    scale_fill_manual(values = c(Upregulated = "#D7301F", Downregulated = "#2171B5")) +
+    theme_minimal() + labs(title = title, x = "TE class", y = "Count", fill = "") +
+    theme(plot.title = element_text(hjust = 0.5))
+  save_plot(p, path)
+}
+plot_pie_by_dir <- function(df, title, path) {
+  if (!nrow(df)) return(invisible(NULL))
+  pie <- df %>% count(dir, Class, name = "Count") %>% group_by(dir) %>%
+    mutate(Pct = 100 * Count / sum(Count), label = if_else(Pct >= 3, paste0(Class, "\n", sprintf("%.1f%%", Pct)), "")) %>% ungroup()
+  p <- ggplot(pie, aes("", Pct, fill = Class)) + geom_col(width = 1) +
+    geom_text(aes(label = label), position = position_stack(vjust = 0.5), size = 3) +
+    coord_polar(theta = "y") + facet_wrap(~ dir) + scale_fill_manual(values = class_cols) +
+    theme_void() + labs(title = title) + theme(strip.text = element_text(size = 12, face = "bold"),
+                                               plot.title = element_text(hjust = 0.5))
+  save_plot(p, path, 10, 6)
+}
+plot_proportion_sets <- function(bg, de, title, path) {
+  if (!nrow(de)) return(invisible(NULL))
+  comb <- bind_rows(bg %>% transmute(Class, Set = "All tested TEs"), de %>% transmute(Class, Set = "DE TEs"),
+                    de %>% filter(dir == "Upregulated") %>% transmute(Class, Set = "Upregulated"),
+                    de %>% filter(dir == "Downregulated") %>% transmute(Class, Set = "Downregulated")) %>%
+    count(Set, Class, name = "Count") %>% group_by(Set) %>% mutate(Proportion = Count / sum(Count), n = sum(Count)) %>%
+    ungroup() %>% mutate(Set = factor(Set, levels = c("All tested TEs", "DE TEs", "Upregulated", "Downregulated")))
+  lab <- comb %>% distinct(Set, n)
+  p <- ggplot(comb, aes(Set, Proportion, fill = Class)) + geom_col(width = 0.6) +
+    geom_text(data = lab, aes(Set, 1.03, label = paste0("n=", n)), inherit.aes = FALSE, size = 3) +
+    scale_y_continuous(labels = percent_format(1)) + scale_fill_manual(values = class_cols) +
+    theme_minimal(base_size = 13) + labs(title = title, x = NULL, y = "Proportion", fill = "TE class") +
+    theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 30, hjust = 1))
+  save_plot(p, path, 9, 6)
+}
+plot_count_universal <- function(bg, de, title, path) {
+  if (!nrow(de)) return(invisible(NULL))
+  comb <- bind_rows(bg %>% count(Class, name = "Count") %>% mutate(Set = "All tested TEs"),
+                    de %>% filter(dir == "Upregulated") %>% count(Class, name = "Count") %>% mutate(Set = "Upregulated"),
+                    de %>% filter(dir == "Downregulated") %>% count(Class, name = "Count") %>% mutate(Set = "Downregulated")) %>%
+    mutate(Set = factor(Set, levels = c("All tested TEs", "Upregulated", "Downregulated")))
+  p <- ggplot(comb, aes(Set, Count, fill = Class)) + geom_col() + coord_flip() + scale_fill_manual(values = class_cols) +
+    theme_minimal(base_size = 13) + labs(title = title, x = NULL, y = "TE count", fill = "TE class") +
+    theme(plot.title = element_text(hjust = 0.5))
+  save_plot(p, path, 10, 5)
+}
+plot_top_subfamilies <- function(de, title, path, n = 20) {
+  if (!nrow(de)) return(invisible(NULL))
+  cnt  <- de %>% count(Subfamily, Class, dir, name = "Count") %>% group_by(Subfamily) %>% mutate(T = sum(Count)) %>% ungroup()
+  keep <- cnt %>% distinct(Subfamily, T) %>% arrange(desc(T)) %>% head(n) %>% pull(Subfamily)
+  top  <- cnt %>% filter(Subfamily %in% keep) %>%
+    mutate(Count = if_else(dir == "Downregulated", -Count, Count), Subfamily = reorder(Subfamily, T))
+  p <- ggplot(top, aes(Subfamily, Count, fill = Class)) + geom_col() + coord_flip() + geom_hline(yintercept = 0) +
+    scale_fill_manual(values = class_cols) + theme_minimal() +
+    labs(title = title, x = NULL, y = "# DE features (left = down, right = up)") + theme(plot.title = element_text(hjust = 0.5))
+  save_plot(p, path, 8, 7)
+}
+plot_volcano <- function(res, title, path, xlim = NULL, ylim = NULL) {
+  d <- res %>% filter(!is.na(padj)) %>%
+    mutate(y = pmin(-log10(pmax(padj, 1e-300)), 300),
+           Significance = case_when(padj < PADJ_CUT & log2FoldChange >  LFC_CUT ~ "Upregulated",
+                                    padj < PADJ_CUT & log2FoldChange < -LFC_CUT ~ "Downregulated", TRUE ~ "Not significant"),
+           out = FALSE)
+  if (!is.null(xlim)) d <- d %>% mutate(out = abs(log2FoldChange) > xlim | y > ylim,
+                                        log2FoldChange = pmax(pmin(log2FoldChange, xlim), -xlim), y = pmin(y, ylim))
+  lab <- d %>% filter(Significance != "Not significant") %>% arrange(padj) %>% head(15)
+  lab$short <- if (nrow(lab) && !all(is.na(lab$Locus))) lab$Locus else lab$Subfamily
+  p <- ggplot(d, aes(log2FoldChange, y, color = Significance)) + geom_point(aes(shape = out), alpha = 0.6, size = 1) +
+    scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 17), guide = "none") +
+    scale_color_manual(values = c("Not significant" = "grey75", Upregulated = "#D7301F", Downregulated = "#2171B5")) +
+    geom_vline(xintercept = c(-LFC_CUT, LFC_CUT), linetype = "dashed") + geom_hline(yintercept = -log10(PADJ_CUT), linetype = "dashed") +
+    theme_bw(base_size = 13) +
+    labs(title = title, subtitle = paste0("Up: ", sum(d$Significance == "Upregulated"), "   Down: ",
+                                          sum(d$Significance == "Downregulated")), x = "log2 fold change", y = "-log10 padj")
+  if (nrow(lab)) p <- p + geom_text_repel(data = lab, aes(label = short), size = 2.6, color = "black", max.overlaps = 30)
+  if (!is.null(xlim)) p <- p + coord_cartesian(xlim = c(-xlim, xlim), ylim = c(0, ylim))
+  save_plot(p, path, 8, 7)
+}
+ord  <- order(coldata$group)
+gaps <- cumsum(table(coldata$group[ord]))[-nlevels(coldata$group)]
+ann_c <- data.frame(group = coldata$group, genotype = coldata$genotype, treatment = coldata$treatment,
+                    row.names = SAMPLES)[ord, ]
+plot_te_heatmap <- function(vmat, ids, level, title, path, max_te = 100) {
+  ids <- intersect(ids, rownames(vmat))
+  if (length(ids) < 2) { message("Heatmap skipped (<2 TEs): ", title); return(invisible(NULL)) }
+  if (length(ids) > max_te) {
+    ids <- ids[order(rowVars(vmat[ids, , drop = FALSE]), decreasing = TRUE)][1:max_te]
+    title <- paste0(title, " (top ", max_te, " by variance)")
+  }
+  m <- zrow(vmat[ids, SAMPLES[ord], drop = FALSE]); ann <- annotate_te(ids, level)
+  rownames(m) <- make.unique(if (level == "locus") ann$Locus else ann$Subfamily)
+  ra <- data.frame(Class = ann$Class, row.names = rownames(m))
+  args <- list(mat = m, color = hm_cols, breaks = seq(-2, 2, length.out = 256), cluster_cols = FALSE, cluster_rows = TRUE,
+               gaps_col = gaps, annotation_col = ann_c, annotation_row = ra, annotation_colors = ann_colors,
+               show_rownames = length(ids) <= 60, fontsize_row = 6, main = paste0(title, " (n = ", length(ids), ")"))
+  do.call(pheatmap, args)
+  do.call(pheatmap, c(args, list(filename = path, width = 8, height = max(5, min(14, length(ids) * 0.12 + 3)))))
+}
+```
+
+# Part A — per-dataset analysis
+
+```{r run_function}
+run_te_analysis <- function(name, full) {
+  od <- file.path(OUTDIR, name); dir.create(od, showWarnings = FALSE)
+  full <- full[, SAMPLES]
+  ids <- rownames(full); te <- is_te(ids); cls <- te_class(ids)
+  real <- te & cls %in% KEEP_CLASSES; level <- te_level(ids[te][1])
+  cat("\n=====", name, "(", level, "level ) =====\n")
+  cat("features:", length(ids), "| genes:", sum(!te), "| TE features:", sum(te), "| real-TE kept:", sum(real), "\n")
+
+  # library composition
+  comp <- rbind(Genes = colSums(full[!te, , drop = FALSE]), rowsum(full[real, , drop = FALSE], cls[real]),
+                `Other repeats` = colSums(full[te & !real, , drop = FALSE]))
+  comp_df <- as.data.frame(comp) %>% rownames_to_column("Category") %>%
+    pivot_longer(-Category, names_to = "Sample", values_to = "Counts") %>% group_by(Sample) %>%
+    mutate(Fraction = Counts / sum(Counts)) %>% ungroup() %>%
+    mutate(Sample = factor(Sample, levels = SAMPLES[ord]), Category = factor(Category, levels = c("Genes", KEEP_CLASSES, "Other repeats")))
+  write.csv(comp_df, file.path(od, "library_composition.csv"), row.names = FALSE)
+  p <- ggplot(comp_df %>% filter(Category != "Genes"), aes(Sample, Fraction, fill = Category)) + geom_col() +
+    scale_y_continuous(labels = percent_format(0.1)) + scale_fill_manual(values = c(class_cols, `Other repeats` = "grey60")) +
+    theme_minimal() + theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(title = paste(name, "— fraction of assigned reads in TEs"), x = NULL, y = "fraction of assigned reads")
+  save_plot(p, file.path(od, "dist_library_TE_fraction.pdf"), 9, 5)
+
+  # DESeq2
+  sf   <- estimateSizeFactorsForMatrix(full[rowSums(full) > 0, , drop = FALSE])
+  te_f <- filter_by_group(full[real, , drop = FALSE], as.character(coldata$group), MIN_COUNT, MIN_SAMPLES)
+  cat("TE features after filter:", nrow(te_f), "\n")
+  dds <- DESeqDataSetFromMatrix(te_f, coldata, ~ group); sizeFactors(dds) <- sf
+  dds <- DESeq(dds, quiet = TRUE)
+  CT  <- make_contrasts(dds)
+  bg  <- annotate_te(rownames(te_f), level)
+
+  # QC
+  vsd <- safe_vst(dds, blind = TRUE)
+  pca <- plotPCA(vsd, intgroup = c("genotype", "treatment"), returnData = TRUE); pv <- round(100 * attr(pca, "percentVar"))
+  p <- ggplot(pca, aes(PC1, PC2, color = genotype, shape = treatment, label = name)) + geom_point(size = 5) +
+    geom_text_repel(size = 3, color = "black") + scale_color_manual(values = geno_cols) + theme_bw(base_size = 13) +
+    labs(x = paste0("PC1 ", pv[1], "%"), y = paste0("PC2 ", pv[2], "%"), title = paste(name, "— PCA of TE expression"))
+  save_plot(p, file.path(od, "QC_PCA.pdf"), 8, 6)
+  cm <- cor(assay(vsd))[SAMPLES[ord], SAMPLES[ord]]
+  pheatmap(cm, display_numbers = TRUE, number_format = "%.2f", cluster_rows = FALSE, cluster_cols = FALSE,
+           gaps_col = gaps, gaps_row = gaps, annotation_col = ann_c, annotation_colors = ann_colors,
+           main = paste(name, "— sample correlation (VST)"),
+           filename = file.path(od, "QC_sample_correlation.pdf"), width = 9, height = 8)
+
+  # contrasts
+  res_list <- list(); sig_list <- list(); diag_list <- list()
+  for (cn in names(CT)) {
+    rr <- results(dds, contrast = CT[[cn]], alpha = PADJ_CUT)
+    diag_list[[cn]] <- tibble(dataset = name, contrast = cn, tested = nrow(rr), after_indep_filter = sum(!is.na(rr$padj)),
+      raw_p_lt_0.01 = sum(rr$pvalue < 0.01, na.rm = TRUE), min_padj = suppressWarnings(signif(min(rr$padj, na.rm = TRUE), 3)),
+      sig_padj_only = sum(rr$padj < PADJ_CUT, na.rm = TRUE),
+      sig_padj_and_LFC = sum(rr$padj < PADJ_CUT & abs(rr$log2FoldChange) > LFC_CUT, na.rm = TRUE))
+    p <- ggplot(as.data.frame(rr) %>% filter(!is.na(pvalue)), aes(pvalue)) + geom_histogram(breaks = seq(0, 1, 0.025), fill = "grey50") +
+      theme_minimal() + labs(title = paste(name, "—", cn, ": p-value histogram"))
+    save_plot(p, file.path(od, paste0("QC_pvalue_hist_", cn, ".pdf")), 7, 4)
+
+    r <- as.data.frame(rr) %>% rownames_to_column("TE_ID") %>% left_join(bg, by = "TE_ID")
+    if (level == "locus") r <- r %>% left_join(te_coords, by = "Locus")
+    r <- r %>% arrange(padj)
+    sig <- r %>% filter(!is.na(padj), padj < PADJ_CUT, abs(log2FoldChange) > LFC_CUT) %>%
+      mutate(dir = if_else(log2FoldChange > 0, "Upregulated", "Downregulated"))
+    write.csv(r,   file.path(od, paste0("TE_", cn, "_all.csv")), row.names = FALSE)
+    write.csv(sig, file.path(od, paste0("TE_", cn, "_sig.csv")), row.names = FALSE)
+    if (level == "locus" && nrow(sig))
+      write.table(sig %>% filter(!is.na(chr)) %>% transmute(chr, start, end, name = TE_ID, score = round(log2FoldChange, 2), strand),
+                  file.path(od, paste0("TE_", cn, "_sig_loci.bed")), sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+    cat(sprintf("  %s: %d sig (up %d, down %d)\n", cn, nrow(sig), sum(sig$dir == "Upregulated"), sum(sig$dir == "Downregulated")))
+    res_list[[cn]] <- r; sig_list[[cn]] <- sig
+  }
+
+  # class plots
+  for (cn in names(CT)) {
+    s <- sig_list[[cn]]; tt <- paste(name, "—", gsub("_", " ", cn))
+    plot_bar_class(s,           paste(tt, ": class (up vs down)"),   file.path(od, paste0(cn, "_bar_class.pdf")))
+    plot_pie_by_dir(s,          paste(tt, ": class composition"),    file.path(od, paste0(cn, "_pie.pdf")))
+    plot_proportion_sets(bg, s, paste(tt, ": proportion vs tested"), file.path(od, paste0(cn, "_proportion.pdf")))
+    plot_count_universal(bg, s, paste(tt, ": counts"),               file.path(od, paste0(cn, "_count_bar.pdf")))
+    plot_top_subfamilies(s,     paste(tt, ": top subfamilies"),      file.path(od, paste0(cn, "_top_subfamilies.pdf")))
+  }
+
+  # volcano: shared axes for NT and sg7
+  allx <- unlist(lapply(res_list[MAIN], function(r) abs(r$log2FoldChange))); ally <- unlist(lapply(res_list[MAIN], function(r) -log10(r$padj)))
+  xl <- max(2, ceiling(quantile(allx[is.finite(allx)], 0.999, na.rm = TRUE)))
+  yl <- max(3, ceiling(quantile(ally[is.finite(ally)], 0.999, na.rm = TRUE)))
+  for (cn in MAIN) plot_volcano(res_list[[cn]], paste(name, "—", gsub("_", " ", cn)), file.path(od, paste0("volcano_", cn, ".pdf")), xl, yl)
+  plot_volcano(res_list$Interaction, paste(name, "— Interaction"), file.path(od, "volcano_Interaction.pdf"))
+
+  # heatmaps
+  vmat <- assay(safe_vst(dds, blind = FALSE))
+  for (cn in names(CT)) plot_te_heatmap(vmat, sig_list[[cn]]$TE_ID, level, paste(name, "— DE TEs", gsub("_", " ", cn)),
+                                        file.path(od, paste0("heatmap_", cn, ".pdf")))
+  vv <- rowVars(vmat); top <- head(order(vv, decreasing = TRUE), min(500, sum(vv > 0)))
+  if (length(top) >= 2)
+    pheatmap(zrow(vmat[top, SAMPLES[ord]]), color = hm_cols, breaks = seq(-2, 2, length.out = 256), show_rownames = FALSE,
+             cluster_cols = FALSE, gaps_col = gaps, annotation_col = ann_c, annotation_colors = ann_colors,
+             main = paste(name, "— top variable TEs"), filename = file.path(od, "heatmap_top500_variable.pdf"), width = 7, height = 7)
+
+  # NT vs sg7 PD1 response
+  a <- res_list$NT_PD1_vs_PBS; b <- res_list$sg7_PD1_vs_PBS
+  for (d0 in c("Upregulated", "Downregulated"))
+    safe_venn(sig_list$NT_PD1_vs_PBS$TE_ID[sig_list$NT_PD1_vs_PBS$dir == d0],
+              sig_list$sg7_PD1_vs_PBS$TE_ID[sig_list$sg7_PD1_vs_PBS$dir == d0], c("NT", "sg7"), c("#2171B5", "#D94801"),
+              file.path(od, paste0("Venn_PD1_", d0, "_NT_vs_sg7.pdf")), main = paste("PD1", d0, "TEs"))
+  cmp <- a %>% select(TE_ID, Class, Subfamily, LFC_NT = log2FoldChange, padj_NT = padj) %>%
+    inner_join(b %>% select(TE_ID, LFC_sg7 = log2FoldChange, padj_sg7 = padj), by = "TE_ID") %>%
+    mutate(sNT = !is.na(padj_NT) & padj_NT < PADJ_CUT & abs(LFC_NT) > LFC_CUT,
+           s7  = !is.na(padj_sg7) & padj_sg7 < PADJ_CUT & abs(LFC_sg7) > LFC_CUT,
+           category = case_when(sNT & s7 & sign(LFC_NT) == sign(LFC_sg7) ~ "Shared", sNT & s7 ~ "Opposite",
+                                sNT ~ "NT only", s7 ~ "sg7 only", TRUE ~ "Neither"))
+  write.csv(cmp %>% select(-sNT, -s7), file.path(od, "Compare_NT_vs_sg7_PD1_response.csv"), row.names = FALSE)
+  print(table(cmp$category, cmp$Class))
+  dd <- cmp %>% filter(category != "Neither")
+  if (nrow(dd)) {
+    lim <- max(abs(c(dd$LFC_NT, dd$LFC_sg7)), na.rm = TRUE)
+    p <- ggplot(dd, aes(LFC_NT, LFC_sg7, color = Class, shape = category)) +
+      geom_hline(yintercept = 0, color = "grey60") + geom_vline(xintercept = 0, color = "grey60") +
+      geom_abline(linetype = "dashed", color = "grey50") + geom_point(alpha = 0.8, size = 2) +
+      scale_color_manual(values = class_cols) + coord_equal(xlim = c(-lim, lim), ylim = c(-lim, lim)) + theme_bw(base_size = 13) +
+      labs(title = paste(name, "— PD1 response, NT vs sg7 (TEs significant in either)"),
+           x = "log2FC PD1 vs PBS in NT", y = "log2FC PD1 vs PBS in sg7")
+    save_plot(p, file.path(od, "Quadrant_PD1_response_NT_vs_sg7.pdf"), 8, 8)
+  }
+
+  # diagnostics + filter sensitivity
+  diag <- bind_rows(diag_list); write.csv(diag, file.path(od, "QC_DE_diagnostics.csv"), row.names = FALSE)
+  sens <- bind_rows(lapply(SENS_MIN_COUNTS, function(mc) {
+    tf <- filter_by_group(full[real, , drop = FALSE], as.character(coldata$group), mc, MIN_SAMPLES)
+    if (nrow(tf) < 20) return(NULL)
+    d <- DESeqDataSetFromMatrix(tf, coldata, ~ group); sizeFactors(d) <- sf; d <- DESeq(d, quiet = TRUE)
+    bind_rows(lapply(names(CT), function(cn) { x <- results(d, contrast = CT[[cn]], alpha = PADJ_CUT)
+      tibble(dataset = name, MIN_COUNT = mc, contrast = cn, tested = nrow(tf),
+             sig_padj_and_LFC = sum(x$padj < PADJ_CUT & abs(x$log2FoldChange) > LFC_CUT, na.rm = TRUE)) }))
+  }))
+  write.csv(sens, file.path(od, "QC_filter_sensitivity.csv"), row.names = FALSE)
+  list(name = name, level = level, full = full, res = res_list, sig = sig_list, diag = diag, sens = sens, cmp = cmp)
+}
+```
+
+```{r run_all}
+results_all <- list()
+for (nm in names(DATASETS)) {
+  results_all[[nm]] <- tryCatch(run_te_analysis(nm, load_cnt(DATASETS[[nm]], SAMPLES)),
+                                error = function(e) { message("FAILED ", nm, ": ", conditionMessage(e)); NULL })
+  invisible(gc())
+}
+done <- Filter(Negate(is.null), results_all)
+cat("\nCompleted:", paste(names(done), collapse = ", "), "\n")
+diag_all <- bind_rows(lapply(done, `[[`, "diag")); sens_all <- bind_rows(lapply(done, `[[`, "sens"))
+write.csv(diag_all, file.path(OUTDIR, "QC_DE_diagnostics_all.csv"), row.names = FALSE)
+write.csv(sens_all, file.path(OUTDIR, "QC_filter_sensitivity_all.csv"), row.names = FALSE)
+print(diag_all, width = Inf); print(sens_all, n = Inf, width = Inf)
+```
+
+# Part B — TElocal (rolled up to subfamily) vs TEcount
+
+```{r cmp_levels}
+cmp_dir <- file.path(OUTDIR, "Compare_TElocal_vs_TEcount"); dir.create(cmp_dir, showWarnings = FALSE)
+tl <- results_all$TElocal; tc <- results_all$TEcount
+if (is.null(tl) || is.null(tc)) {
+  message("Part B skipped: needs both TElocal and TEcount.")
+} else {
+  real_ids <- function(m) { i <- rownames(m); i[is_te(i) & te_class(i) %in% KEEP_CLASSES] }
+  loc  <- tl$full[real_ids(tl$full), SAMPLES, drop = FALSE]
+  roll <- rowsum(loc, sub_key(rownames(loc)))
+  tcm  <- tc$full[real_ids(tc$full), SAMPLES, drop = FALSE]
+  k    <- intersect(rownames(roll), rownames(tcm))
+  rt <- tibble(Key = k, Class = te_class(k), TElocal_rollup = rowMeans(roll[k, , drop = FALSE]), TEcount = rowMeans(tcm[k, , drop = FALSE]))
+  cat("subfamilies in both:", length(k), "| Spearman:", round(cor(rt$TElocal_rollup, rt$TEcount, method = "spearman"), 3), "\n")
+  p <- ggplot(rt, aes(log10(TEcount + 1), log10(TElocal_rollup + 1), color = Class)) + geom_point(alpha = 0.7, size = 1.2) +
+    geom_abline(linetype = "dashed") + scale_color_manual(values = class_cols) + theme_bw() +
+    labs(title = "Subfamily counts: TEcount vs TElocal summed over loci", x = "log10(TEcount mean + 1)", y = "log10(TElocal rollup mean + 1)")
+  save_plot(p, file.path(cmp_dir, "TEcount_vs_TElocal_rollup.pdf"), 7, 6)
+  ov <- bind_rows(lapply(names(tc$sig), function(cn) {
+    a <- tc$sig[[cn]]$TE_ID; b <- unique(sub_key(tl$sig[[cn]]$TE_ID))
+    tibble(contrast = cn, TEcount_DE_subfamilies = length(a), subfamilies_with_DE_locus = length(b), overlap = length(intersect(a, b)))
+  }))
+  write.csv(ov, file.path(cmp_dir, "subfamily_DE_overlap.csv"), row.names = FALSE); print(ov, width = Inf)
+}
+```
+
+# Summary
+
+```{r summary}
+summ <- bind_rows(lapply(done, function(x) bind_rows(lapply(names(x$sig), function(cn) { s <- x$sig[[cn]]
+  tibble(dataset = x$name, level = x$level, comparison = cn, DE = nrow(s),
+         up = sum(s$dir == "Upregulated"), down = sum(s$dir == "Downregulated")) }))))
+write.csv(summ, file.path(OUTDIR, "SUMMARY_DE_counts.csv"), row.names = FALSE)
+print(summ, n = Inf, width = Inf)
+sessionInfo()
+```

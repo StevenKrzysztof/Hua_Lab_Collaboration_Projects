@@ -1,0 +1,23 @@
+Reference genome and annotation (mouse) — all steps use ONE release
+=====================================================================
+Genome           : GRCm38 (mm10) primary assembly, GENCODE       GRCm38.primary_assembly.genome.fa
+Gene annotation  : GENCODE vM25 (Ensembl 100)                    gencode.vM25.annotation.gtf
+Transcriptome    : GENCODE vM25 transcripts                      gencode.vM25.transcripts.fa.gz
+                   https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M25/gencode.vM25.transcripts.fa.gz
+STAR index       : GRCm38 + vM25 GTF, --sjdbOverhang 149                         (scripts/upstream/00_build_refs_vM25.sh)
+Salmon index     : decoy-aware (vM25 transcripts + all genome sequences as decoys), -k 31, --gencode
+tx2gene          : built from the vM25 GTF 'transcript' lines: transcript_id -> gene_id, gene_name, gene_type
+                   (versioned IDs, identical to Salmon --gencode transcript names; import stops if >1% unmatched)
+TE annotation    : Hammell lab mm10 RepeatMasker TE GTF (mm10_rmsk_TE.gtf) and TElocal index (mm10_rmsk_TE.gtf.locInd)
+Gene sets        : MSigDB Hallmark (mouse, via msigdbr), GO BP (org.Mm.eg.db), KEGG (mmu, online at run time)
+
+Gene identifiers and symbols
+----------------------------
+* Gene-level quantification is keyed on versioned GENCODE gene_id (ENSMUSG...).
+* Gene symbols come from the vM25 GTF gene_name attribute (not from org.Mm.eg.db), so every quantified gene keeps a symbol.
+  If a gene_name were missing, the gene_id is used as the label.
+* Duplicate symbols (several gene_ids, same gene_name) are kept as separate rows in all tables; only heatmap row
+  labels are made unique (make.unique), and statistics are never collapsed by symbol.
+* Enrichment: GO BP and Hallmark use version-less Ensembl IDs directly (no symbol mapping). KEGG needs Entrez IDs:
+  Ensembl -> Entrez via org.Mm.eg.db (mapIds, multiVals = "first"); genes without an Entrez ID are dropped for KEGG only.
+* GSEA ranking: DESeq2 Wald statistic; when several rows map to the same key, the row with the largest |stat| is kept.
