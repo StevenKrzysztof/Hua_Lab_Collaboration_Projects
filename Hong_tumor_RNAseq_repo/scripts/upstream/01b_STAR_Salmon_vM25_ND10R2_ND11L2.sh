@@ -8,7 +8,7 @@
 #SBATCH --partition=HTC
 #SBATCH --output=%x_%A_%a.out
 #SBATCH --error=%x_%A_%a.err
-#SBATCH --mail-user=ZIW183@pitt.edu
+#SBATCH --mail-user=your_email
 #SBATCH --mail-type=END,FAIL
 # Hong tumor RNA-seq (NT/sg7 x PBS/PD1): retrim from RAW -> validate -> STAR + Salmon (GENCODE vM25)
 # The old *_trimmed_R*.fq.gz files are corrupt (interleaved records), so this script
